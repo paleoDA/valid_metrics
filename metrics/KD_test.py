@@ -1,0 +1,449 @@
+import numpy as np
+import cfr
+import matplotlib.pyplot as plt
+import xarray as xr
+import pandas as pd
+from statsmodels.stats.multitest import fdrcorrection
+
+## Integrated Tukey depth functions
+
+def depth_vectorized(g, fmat):
+    """
+    Compute univariate Tukey depth at each gridpoint.
+    
+    Parameters
+    ----------
+    g : ndarray, shape (n_gridpoints,)
+        Single ensemble member to evaluate
+    fmat : ndarray, shape (n_gridpoints, n_ensemble)
+        Reference ensemble
+    
+    Returns
+    -------
+    ndarray, shape (n_gridpoints,)
+        Depth at each gridpoint
+    """
+    n_ensemble = fmat.shape[1]
+    
+    # Broadcasting: compare g to all ensemble members
+    signs = np.sign(g[:, None] - fmat)
+    diff = np.abs(np.sum(signs, axis=1))
+    depth_values = 1 - (diff / n_ensemble)
+    
+    return depth_values
+
+
+def int_depth_vectorized(gmat, fmat):
+    """
+    Compute integrated Tukey depth for each ensemble member in gmat.
+    
+    Parameters
+    ----------
+    gmat : ndarray, shape (n_gridpoints, n_ensemble_g)
+        Ensemble to evaluate
+    fmat : ndarray, shape (n_gridpoints, n_ensemble_f)
+        Reference ensemble
+    
+    Returns
+    -------
+    ndarray, shape (n_ensemble_g,)
+        Integrated depth for each member of gmat
+    """
+    n_ensemble_g = gmat.shape[1]
+    
+    integrated_depths = np.array([
+        np.mean(depth_vectorized(gmat[:, j], fmat))
+        for j in range(n_ensemble_g)
+    ])
+    
+    return integrated_depths
+
+
+def reshape_for_depth(data_array, year_idx):
+    """
+    Extract and reshape data for a single year.
+    
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Shape (time, ens, lat, lon)
+    year_idx : int
+        Which year to extract
+    
+    Returns
+    -------
+    ndarray, shape (n_gridpoints, n_ensemble)
+    """
+    year_data = data_array[year_idx, :, :, :]
+    n_ens = year_data.shape[0]
+    n_gridpoints = year_data.shape[1] * year_data.shape[2]
+    
+    year_reshaped = year_data.values.reshape(n_ens, n_gridpoints)
+    return year_reshaped.T
+
+## Main KStat Function
+
+
+def ks_cdf(x, n=20):
+    """
+    Calculate the CDF of the Kolmogorov distribution.
+    
+    Parameters
+    ----------
+    x : float
+        A positive number
+    n : int, optional
+        Number of terms to include in the series. Default is 20.
+    
+    Returns
+    -------
+    float
+        Probability P(K <= x) under Kolmogorov distribution
+    
+    Notes
+    -----
+    This implements the series expansion:
+    P(K <= x) = 1 - 2 * sum_{k=1}^{n} (-1)^(k-1) * exp(-2k²x²)
+    """
+    if x < 0.05:
+        return 0.0
+    
+    # Compute the alternating sum
+    terms = np.array([
+        ((-1)**(k-1)) * np.exp(-2 * (k**2) * (x**2))
+        for k in range(1, n+1)
+    ])
+    
+    return 1 - 2 * np.sum(terms)
+
+
+def kstat(fmat, gmat):
+    """
+    Test if functions in fmat and gmat are equal in distribution using KD statistic.
+    
+    This is the core Kolmogorov Depth (KD) test statistic from Harris et al. (2021).
+    
+    Parameters
+    ----------
+    fmat : ndarray, shape (n_gridpoints, n_ensemble_f)
+        First ensemble (e.g., LMR reconstruction)
+    gmat : ndarray, shape (n_gridpoints, n_ensemble_g)
+        Second ensemble (e.g., PReSto reconstruction)
+    
+    Returns
+    -------
+    tuple (kd_statistic, p_value)
+        kd_statistic : float
+            The KD test statistic
+        p_value : float
+            P-value under null hypothesis of equal distributions
+    
+    Notes
+    -----
+    The test is symmetric and tests H0: P = Q vs Ha: P ≠ Q
+    where P and Q are the distributions of fmat and gmat.
+    """
+    # Step 1: Compute integrated depths
+    # ff.xd: depth of fmat members relative to fmat
+    ff_xd = int_depth_vectorized(fmat, fmat)
+    
+    # fg.xd: depth of fmat members relative to gmat  
+    fg_xd = int_depth_vectorized(fmat, gmat)
+    
+    # gg.xd: depth of gmat members relative to gmat
+    gg_xd = int_depth_vectorized(gmat, gmat)
+    
+    # gf.xd: depth of gmat members relative to fmat
+    gf_xd = int_depth_vectorized(gmat, fmat)
+    
+    # Step 2: Compute empirical CDFs
+    # For each depth value in ff.xd, what proportion of ff.xd values are <= it?
+    ff_cdf = np.array([np.mean(ff_xd <= y) for y in ff_xd])
+    
+    # For each depth value in ff.xd, what proportion of gf.xd values are <= it?
+    gf_cdf = np.array([np.mean(gf_xd <= y) for y in ff_xd])
+    
+    # For each depth value in gg.xd, what proportion of fg.xd values are <= it?
+    fg_cdf = np.array([np.mean(fg_xd <= y) for y in gg_xd])
+    
+    # For each depth value in gg.xd, what proportion of gg.xd values are <= it?
+    gg_cdf = np.array([np.mean(gg_xd <= y) for y in gg_xd])
+    
+    # Step 3: Compute KD statistic components
+    n_f = fmat.shape[1]
+    n_g = gmat.shape[1]
+    rate = np.sqrt((n_g * n_f) / (n_g + n_f))
+    
+    # Maximum deviation using fmat as reference
+    ksf = np.max(np.abs(ff_cdf - gf_cdf))
+    
+    # Maximum deviation using gmat as reference
+    ksg = np.max(np.abs(gg_cdf - fg_cdf))
+    
+    # Overall KD statistic (symmetric)
+    kd = max(ksf, ksg)
+    
+    # Step 4: Compute p-value using Kolmogorov distribution
+    p_value = 1 - ks_cdf(rate * kd)
+    
+    return kd, p_value
+
+
+def kstat_perm(fmat, gmat, perms=500, random_state=None):
+    """
+    Test if functions in fmat and gmat are equal in distribution using 
+    permutation-based p-value.
+    
+    Parameters
+    ----------
+    fmat : ndarray, shape (n_gridpoints, n_ensemble_f)
+        First ensemble
+    gmat : ndarray, shape (n_gridpoints, n_ensemble_g)
+        Second ensemble
+    perms : int, optional
+        Number of permutations for permutation test. Default is 500.
+    random_state : int, optional
+        Random seed for reproducibility
+    
+    Returns
+    -------
+    tuple (kd_statistic, p_value_perm)
+        kd_statistic : float
+            The KD test statistic
+        p_value_perm : float
+            Permutation-based p-value
+    
+    Notes
+    -----
+    This is more computationally expensive but doesn't rely on 
+    asymptotic Kolmogorov distribution approximation.
+    Useful for small samples or when asymptotic assumptions may not hold.
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+    
+    # Compute observed KD statistic
+    kd_observed, _ = kstat(fmat, gmat)
+    
+    # Combine both ensembles
+    hmat = np.column_stack([fmat, gmat])
+    n_total = hmat.shape[1]
+    n_f = fmat.shape[1]
+    
+    # Generate permutation distribution
+    kd_dist = np.zeros(perms)
+    
+    for i in range(perms):
+        # Randomly permute columns
+        perm_idx = np.random.permutation(n_total)
+        hstar = hmat[:, perm_idx]
+        
+        # Split into two groups of original sizes
+        fstar = hstar[:, :n_f]
+        gstar = hstar[:, n_f:]
+        
+        # Compute KD statistic for permuted data
+        kd_dist[i], _ = kstat(fstar, gstar)
+    
+    # Compute permutation p-value
+    p_value_perm = np.mean(kd_dist > kd_observed)
+    
+    return kd_observed, p_value_perm
+
+## Full Algorithm
+def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, perms=500):
+    """
+    Compute time-evolving KD statistic comparing two reconstructions.
+    
+    Parameters
+    ----------
+    data_array_1 : xarray.DataArray
+        First reconstruction (e.g., LMR), shape (time, ens, lat, lon)
+    data_array_2 : xarray.DataArray
+        Second reconstruction (e.g., PReSto), shape (time, ens, lat, lon)
+    use_permutation : bool, optional
+        If True, use permutation test (slower). Default False uses asymptotic.
+    perms : int, optional
+        Number of permutations if use_permutation=True
+    
+    Returns
+    -------
+    dict with keys:
+        'kd_stats': array (n_years,) - KD statistic per year
+        'p_values': array (n_years,) - p-value per year
+        'years': array (n_years,) - year labels from data
+    """
+    n_years = data_array_1.shape[0]
+    
+    kd_stats = np.zeros(n_years)
+    p_values = np.zeros(n_years)
+    
+    for year_idx in range(n_years):
+        if year_idx % 100 == 0:
+            print(f"Processing year {year_idx}/{n_years} (year {data_array_1.coords['time'].values[year_idx]})...")
+        
+        # Prepare data for this year
+        fmat = reshape_for_depth(data_array_1, year_idx)
+        gmat = reshape_for_depth(data_array_2, year_idx)
+        
+        # Compute KD statistic
+        if use_permutation:
+            kd_stats[year_idx], p_values[year_idx] = kstat_perm(fmat, gmat, perms=perms)
+        else:
+            kd_stats[year_idx], p_values[year_idx] = kstat(fmat, gmat)
+    
+    return {
+        'kd_stats': kd_stats,
+        'p_values': p_values,
+        'years': data_array_1.coords['time'].values
+    }
+
+## Compute and Plot
+
+def compute_and_plot_kd(fd1, fd2, ts1, ts2, name1, name2, region=None):
+
+    print(f"Computing KD statistic for {name1} vs {name2}...")
+    results = compute_kd_timeseries(
+        fd1, 
+        fd2,
+        use_permutation=False  # Use asymptotic (fast)
+    )
+
+    print(f"\nCompleted {len(results['kd_stats'])} years")
+    print(f"KD range: [{results['kd_stats'].min():.4f}, {results['kd_stats'].max():.4f}]")
+    print(f"P-value range: [{results['p_values'].min():.4e}, {results['p_values'].max():.4e}]")
+
+    # ========================================
+    # Step 2: Analyze results with BY FDR correction
+    # ========================================
+    
+    alpha = 0.05
+    pvals = results['p_values']
+
+    # Benjamini-Yekutieli FDR correction (for arbitrary dependence)
+    rejected, pvals_adjusted = fdrcorrection(
+        pvals, 
+        alpha=alpha, 
+        method='negcorr'  # BY correction for temporal dependence
+    )
+
+    n_tests = len(pvals)
+    n_significant = np.sum(rejected)
+
+    print(f"\n=== Statistical Summary (Benjamini–Yekutieli FDR) ===")
+    print(f"Significant years (FDR α={alpha}): {n_significant}/{n_tests} ({100*n_significant/n_tests:.1f}%)")
+    print(f"Median KD statistic: {np.median(results['kd_stats']):.4f}")
+
+    # Get years where p < 0.05
+    sig_years_05 = results['years'][pvals < 0.05]
+    print(f"Years with p < 0.05: {len(sig_years_05)} years")
+    
+    # ========================================
+    # Step 3: Compute mean difference time series
+    # ========================================
+    
+    # Difference: ts1.mean - ts2.mean
+    mean_diff = np.abs(ts1.mean - ts2.mean)
+    
+    # ========================================
+    # Step 3.5: Create sorted table of KD vs absolute GMST difference
+    # ========================================
+    
+    # Sort by KD statistic (largest to smallest)
+    sorted_idx = np.argsort(mean_diff)[::-1]
+    
+    kd_gmst_table = pd.DataFrame({
+        'year': results['years'][sorted_idx],
+        'kd_stat': results['kd_stats'][sorted_idx],
+        'abs_gmst_diff': mean_diff[sorted_idx],
+        'p_value': pvals[sorted_idx]
+    })
+    
+    # ========================================
+    # Step 4: Two-panel visualization
+    # ========================================
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    years = results['years']
+
+    # Find shaded regions for KD >= 0.9
+    p_01_mask = results['kd_stats'] >= 0.9
+    if np.any(p_01_mask):
+        # Find starts and ends of contiguous regions
+        diff = np.diff(np.concatenate(([False], p_01_mask, [False])).astype(int))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        
+        # Add shading to top panel
+        for start, end in zip(starts, ends):
+            ax1.axvspan(years[start], years[end-1], color='lightblue', alpha=0.6)
+
+    # Panel 1: KD statistic over time
+    ax1.scatter(years, results['kd_stats'], alpha=0.5, s=10, c='black')
+
+    # Add trend line
+    z = np.polyfit(years, results['kd_stats'], 1)
+    p = np.poly1d(z)
+    ax1.plot(years, p(years), "r-", linewidth=2, label='Trend')
+    ax1.set_ylabel('KD Statistic', fontsize=12)
+
+    if region is not None:
+        ax1.set_title(f'Time Evolution of KD Statistic {region}: {name1} vs {name2}', 
+                     fontsize=14, fontweight='bold')
+    else: 
+        ax1.set_title(f'Time Evolution of KD Statistic: {name1} vs {name2}', 
+                     fontsize=14, fontweight='bold')
+    
+    ax1.grid(True, alpha=0.3)
+    ax1.axhline(y=0.27, color='#000080', linestyle='--', label='KD=0.27 (signif.)')
+    ax1.legend()
+
+    # Panel 2: Mean difference time series
+    # Add shading to bottom panel (same regions)
+    if np.any(p_01_mask):
+        for start, end in zip(starts, ends):
+            ax2.axvspan(years[start], years[end-1], color='lightblue', alpha=0.6)
+    
+    ax2.plot(years, mean_diff, linewidth=1, color='black')
+    
+    ax2.set_ylabel(r'|$\Delta$ GMST|' + f'({name1} - {name2})', fontsize=12)
+    ax2.set_xlabel('Year', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Store results
+    results['sig_years_01'] = sig_years_05
+    results['mean_diff'] = mean_diff
+    results['kd_gmst_table'] = kd_gmst_table
+
+    return results
+
+import numpy as np
+
+## Weighted mean for ensembles 
+def weighted_mean_ts(da):
+    """
+    Calculate area-weighted spatial mean for ensemble data.
+    Returns (time, ens) for KD analysis.
+    
+    Parameters:
+    -----------
+    da : xarray.DataArray
+        DataArray with (time, ens, lat, lon) dimensions
+    
+    Returns:
+    --------
+    xarray.DataArray : Shape (time, ens) - suitable for KD analysis
+    """
+    # Calculate weights based on cosine of latitude
+    weights = np.cos(np.deg2rad(da.lat))
+    weights.name = "weights"
+    
+    # Weight the data and take mean over spatial dimensions only
+    da_weighted = da.weighted(weights)
+    
+    # Mean over lat and lon, keeping time and ens
+    # Result will be (time, ens)
+    return da_weighted.mean(dim=['lat', 'lon'])
