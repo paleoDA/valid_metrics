@@ -117,6 +117,34 @@ def ks_cdf(x, n=20):
     return 1 - 2 * np.sum(terms)
 
 
+def kd_critical_value(n_f, n_g, alpha=0.05, n_terms=20):
+    """
+    Pointwise asymptotic KD critical value for two ensemble sizes.
+
+    This is the inverse of the same Kolmogorov distribution approximation used
+    by kstat, scaled by sqrt((n_f * n_g) / (n_f + n_g)).
+    """
+    if n_f <= 0 or n_g <= 0:
+        raise ValueError("Ensemble sizes must be positive.")
+
+    target = 1 - alpha
+    lo = 0.0
+    hi = 1.0
+
+    while ks_cdf(hi, n=n_terms) < target:
+        hi *= 2
+
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if ks_cdf(mid, n=n_terms) < target:
+            lo = mid
+        else:
+            hi = mid
+
+    rate = np.sqrt((n_f * n_g) / (n_f + n_g))
+    return hi / rate
+
+
 def kstat(fmat, gmat):
     """
     Test if functions in fmat and gmat are equal in distribution using KD statistic.
@@ -300,123 +328,212 @@ def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, per
 
 ## Compute and Plot
 
-def compute_and_plot_kd(fd1, fd2, ts1, ts2, name1, name2, region=None):
+def _mean_ts_values(ts):
+    """Return a 1D mean time series from cfr EnsTS or xarray ensemble series."""
+    if isinstance(ts, xr.DataArray):
+        if 'ens' in ts.dims:
+            return ts.mean(dim='ens').values
+        return ts.values
+
+    mean = getattr(ts, 'mean', None)
+    if mean is not None and not callable(mean):
+        return np.asarray(mean)
+
+    raise TypeError(
+        "Expected a cfr EnsTS-like object or an xarray.DataArray for ts."
+    )
+
+
+def compute_and_plot_kd(
+    fd1,
+    fd2,
+    ts1,
+    ts2,
+    name1,
+    name2,
+    region=None,
+    highlight_threshold=0.9,
+):
 
     print(f"Computing KD statistic for {name1} vs {name2}...")
     results = compute_kd_timeseries(
-        fd1, 
+        fd1,
         fd2,
-        use_permutation=False  # Use asymptotic (fast)
+        use_permutation=False  # Use asymptotic approximation
     )
 
     print(f"\nCompleted {len(results['kd_stats'])} years")
-    print(f"KD range: [{results['kd_stats'].min():.4f}, {results['kd_stats'].max():.4f}]")
-    print(f"P-value range: [{results['p_values'].min():.4e}, {results['p_values'].max():.4e}]")
+    print(
+        f"KD range: "
+        f"[{results['kd_stats'].min():.4f}, "
+        f"{results['kd_stats'].max():.4f}]"
+    )
+    print(
+        f"Raw p-value range: "
+        f"[{results['p_values'].min():.4e}, "
+        f"{results['p_values'].max():.4e}]"
+    )
 
     # ========================================
-    # Step 2: Analyze results with BY FDR correction
+    # Step 2: Benjamini-Yekutieli FDR correction
     # ========================================
-    
+
     alpha = 0.05
     pvals = results['p_values']
 
-    # Benjamini-Yekutieli FDR correction (for arbitrary dependence)
     rejected, pvals_adjusted = fdrcorrection(
-        pvals, 
-        alpha=alpha, 
-        method='negcorr'  # BY correction for temporal dependence
+        pvals,
+        alpha=alpha,
+        method='negcorr'  # BY correction for arbitrary dependence
     )
 
     n_tests = len(pvals)
     n_significant = np.sum(rejected)
+    sig_years_fdr = results['years'][rejected]
 
-    print(f"\n=== Statistical Summary (Benjamini–Yekutieli FDR) ===")
-    print(f"Significant years (FDR α={alpha}): {n_significant}/{n_tests} ({100*n_significant/n_tests:.1f}%)")
+    print("\n=== Statistical Summary (Benjamini-Yekutieli FDR) ===")
+    print(
+        f"Significant years (FDR alpha={alpha}): "
+        f"{n_significant}/{n_tests} "
+        f"({100 * n_significant / n_tests:.1f}%)"
+    )
     print(f"Median KD statistic: {np.median(results['kd_stats']):.4f}")
+    print(f"FDR-significant years: {len(sig_years_fdr)} years")
+    print(
+        f"FDR-adjusted p-value range: "
+        f"[{pvals_adjusted.min():.4e}, "
+        f"{pvals_adjusted.max():.4e}]"
+    )
 
-    # Get years where p < 0.05
-    sig_years_05 = results['years'][pvals < 0.05]
-    print(f"Years with p < 0.05: {len(sig_years_05)} years")
-    
     # ========================================
-    # Step 3: Compute mean difference time series
+    # Step 3: Absolute GMST median difference
     # ========================================
-    
-    # Difference: ts1.mean - ts2.mean
-    mean_diff = np.abs(ts1.mean - ts2.mean)
-    
+
+    mean_diff = np.abs(_mean_ts_values(ts1) - _mean_ts_values(ts2))
+
     # ========================================
-    # Step 3.5: Create sorted table of KD vs absolute GMST difference
+    # Step 3.5: Table sorted by GMST difference
     # ========================================
-    
-    # Sort by KD statistic (largest to smallest)
+
     sorted_idx = np.argsort(mean_diff)[::-1]
-    
+
     kd_gmst_table = pd.DataFrame({
         'year': results['years'][sorted_idx],
         'kd_stat': results['kd_stats'][sorted_idx],
         'abs_gmst_diff': mean_diff[sorted_idx],
-        'p_value': pvals[sorted_idx]
+        'p_value_raw': pvals[sorted_idx],
+        'p_value_fdr': pvals_adjusted[sorted_idx],
+        'significant_fdr': rejected[sorted_idx]
     })
-    
+
     # ========================================
     # Step 4: Two-panel visualization
     # ========================================
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12, 10), sharex=True
+    )
 
     years = results['years']
+    n_f = fd1.sizes['ens']
+    n_g = fd2.sizes['ens']
+    kd_alpha = 0.05
+    kd_threshold = kd_critical_value(n_f, n_g, alpha=kd_alpha)
 
-    # Find shaded regions for KD >= 0.9
-    p_01_mask = results['kd_stats'] >= 0.9
-    if np.any(p_01_mask):
-        # Find starts and ends of contiguous regions
-        diff = np.diff(np.concatenate(([False], p_01_mask, [False])).astype(int))
+    highlight_mask = results['kd_stats'] > highlight_threshold
+    highlight_years = years[highlight_mask]
+    highlight_spans = []
+
+    if np.any(highlight_mask):
+        diff = np.diff(
+            np.concatenate(([False], highlight_mask, [False])).astype(int)
+        )
         starts = np.where(diff == 1)[0]
         ends = np.where(diff == -1)[0]
-        
-        # Add shading to top panel
+
         for start, end in zip(starts, ends):
-            ax1.axvspan(years[start], years[end-1], color='lightblue', alpha=0.6)
+            span = (years[start] - 0.5, years[end - 1] + 0.5)
+            highlight_spans.append(span)
+            ax1.axvspan(*span, color='lightblue', alpha=0.6)
 
-    # Panel 1: KD statistic over time
-    ax1.scatter(years, results['kd_stats'], alpha=0.5, s=10, c='black')
+    # Panel 1: KD statistic
+    ax1.scatter(
+        years,
+        results['kd_stats'],
+        alpha=0.5,
+        s=10,
+        c='black'
+    )
 
-    # Add trend line
     z = np.polyfit(years, results['kd_stats'], 1)
-    p = np.poly1d(z)
-    ax1.plot(years, p(years), "r-", linewidth=2, label='Trend')
+    trend = np.poly1d(z)
+    ax1.plot(
+        years,
+        trend(years),
+        "r-",
+        linewidth=2,
+        label='Trend'
+    )
+
     ax1.set_ylabel('KD Statistic', fontsize=12)
 
     if region is not None:
-        ax1.set_title(f'Time Evolution of KD Statistic {region}: {name1} vs {name2}', 
-                     fontsize=14, fontweight='bold')
-    else: 
-        ax1.set_title(f'Time Evolution of KD Statistic: {name1} vs {name2}', 
-                     fontsize=14, fontweight='bold')
-    
+        ax1.set_title(
+            f'Time Evolution of KD Statistic {region}: '
+            f'{name1} vs {name2}',
+            fontsize=14,
+            fontweight='bold'
+        )
+    else:
+        ax1.set_title(
+            f'Time Evolution of KD Statistic: {name1} vs {name2}',
+            fontsize=14,
+            fontweight='bold'
+        )
+
     ax1.grid(True, alpha=0.3)
-    ax1.axhline(y=0.27, color='#000080', linestyle='--', label='KD=0.27 (signif.)')
+
+    # Pointwise, uncorrected alpha threshold for the loaded ensemble sizes
+    ax1.axhline(
+        y=kd_threshold,
+        color='#000080',
+        linestyle='--',
+        label=(
+            f'KD={kd_threshold:.2f} '
+            f'(alpha={kd_alpha}, n={n_f}/{n_g})'
+        )
+    )
     ax1.legend()
 
-    # Panel 2: Mean difference time series
-    # Add shading to bottom panel (same regions)
-    if np.any(p_01_mask):
-        for start, end in zip(starts, ends):
-            ax2.axvspan(years[start], years[end-1], color='lightblue', alpha=0.6)
-    
-    ax2.plot(years, mean_diff, linewidth=1, color='black')
-    
-    ax2.set_ylabel(r'|$\Delta$ GMST|' + f'({name1} - {name2})', fontsize=12)
+    # Panel 2: Absolute GMST difference
+    for span in highlight_spans:
+        ax2.axvspan(*span, color='lightblue', alpha=0.6)
+
+    ax2.plot(
+        years,
+        mean_diff,
+        linewidth=1,
+        color='black'
+    )
+
+    ax2.set_ylabel(
+        r'|$\Delta$ GMST|' + f' ({name1} - {name2})',
+        fontsize=12
+    )
     ax2.set_xlabel('Year', fontsize=12)
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.show()
 
-    # Store results
-    results['sig_years_01'] = sig_years_05
+    # Store raw and FDR-corrected results
+    results['p_values_adjusted'] = pvals_adjusted
+    results['rejected_fdr'] = rejected
+    results['sig_years_fdr'] = sig_years_fdr
     results['mean_diff'] = mean_diff
     results['kd_gmst_table'] = kd_gmst_table
+    results['highlight_threshold'] = highlight_threshold
+    results['highlight_years'] = highlight_years
 
     return results
 
@@ -447,3 +564,42 @@ def weighted_mean_ts(da):
     # Mean over lat and lon, keeping time and ens
     # Result will be (time, ens)
     return da_weighted.mean(dim=['lat', 'lon'])
+
+
+def compute_and_plot_kd_reg(
+    fd1,
+    fd2,
+    ts1,
+    ts2,
+    name1,
+    name2,
+    region=None,
+    highlight_threshold=0.9,
+):
+    """
+    Regional KD wrapper matching the final-project notebook.
+
+    Parameters are the same as compute_and_plot_kd, with fd1/fd2 usually
+    pre-sliced by latitude and ts1/ts2 produced by weighted_mean_ts.
+    """
+    results = compute_and_plot_kd(
+        fd1,
+        fd2,
+        ts1,
+        ts2,
+        name1,
+        name2,
+        region=region,
+        highlight_threshold=highlight_threshold,
+    )
+
+    high_kd_mask = results['kd_stats'] > highlight_threshold
+    n_high_kd = np.sum(high_kd_mask)
+    total_years = len(results['kd_stats'])
+    print(
+        f"Years with KD > {highlight_threshold}: "
+        f"{n_high_kd}/{total_years} "
+        f"({100 * n_high_kd / total_years:.1f}%)"
+    )
+
+    return results

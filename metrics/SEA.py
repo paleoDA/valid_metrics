@@ -119,6 +119,137 @@ def bootstrap_significance(comp_fd, bootstrap_composites, ci=(2.5, 97.5)):
     return ci_lo, ci_up, sig_cool, sig_warm
 
 
+def difference_field(fd1, fd2, name=None):
+    if fd1.da.shape != fd2.da.shape:
+        raise ValueError("Climate fields must have the same shape to take a difference.")
+
+    diff_da = fd2.da - fd1.da
+    if name is not None:
+        diff_da.name = name
+
+    return cfr.ClimateField(diff_da)
+
+
+def plot_lag_with_significance(
+    comp_fd,
+    warm,
+    cool,
+    lag=1,
+    name="",
+    levels=None,
+    cbar_labels=None,
+    hatch="///",
+    proxydb=None,
+    plot_proxydb=False,
+    plot_proxydb_lgd=True,
+    site_markersize=20,
+):
+    if levels is None:
+        levels = np.linspace(-0.5, 0.5, 21)
+    if cbar_labels is None:
+        cbar_labels = np.linspace(-0.5, 0.5, 11)
+
+    lag_values = comp_fd.da.time.values
+    lag_matches = np.where(lag_values == lag)[0]
+    if len(lag_matches) == 0:
+        raise ValueError(f"Lag {lag} is not in composite lags: {lag_values}.")
+
+    lag_idx = lag_matches[0]
+    volcanic_field = cfr.ClimateField(comp_fd.da.isel(time=lag_idx))
+    insig_mask = ~(warm[lag_idx, :, :] | cool[lag_idx, :, :])
+
+    fig, ax = volcanic_field.plot(
+        levels=levels,
+        cbar_labels=cbar_labels,
+        extend="both",
+        proxydb=proxydb,
+        plot_proxydb=plot_proxydb,
+        plot_proxydb_lgd=plot_proxydb_lgd,
+        site_markersize=site_markersize,
+    )
+
+    lat = volcanic_field.da.lat.values
+    lon = volcanic_field.da.lon.values
+
+    plt.rcParams["hatch.color"] = "gray"
+    plt.rcParams["hatch.linewidth"] = 0.5
+    ax.contourf(
+        lon,
+        lat,
+        insig_mask.astype(float),
+        levels=[0.5, 1.5],
+        colors="none",
+        hatches=[hatch],
+        transform=ccrs.PlateCarree(),
+        alpha=0,
+    )
+
+    ax.set_title(f"{name} Composite, Year {lag}")
+    cbar_ax = fig.axes[-1]
+    cbar_ax.set_title(r"$T$", pad=15)
+
+    return fig, ax
+
+
+def plot_field_sea_sig(
+    events_df,
+    fd,
+    lag=1,
+    before=3,
+    after=6,
+    n_perm=1000,
+    ci=(2.5, 97.5),
+    name="",
+    levels=None,
+    cbar_labels=None,
+    hatch="///",
+    proxydb=None,
+    plot_proxydb=False,
+    plot_proxydb_lgd=True,
+    site_markersize=20,
+):
+    eruption_years = events_df["year"].values
+    comp_fd = composite_sea(eruption_years, fd, before=before, after=after)
+    bootstrap_composites, non_erup = bootstrap(
+        events_df,
+        fd,
+        before=before,
+        after=after,
+        n_perm=n_perm,
+    )
+    ci_lo, ci_up, sig_cool, sig_warm = bootstrap_significance(
+        comp_fd,
+        bootstrap_composites,
+        ci=ci,
+    )
+    fig, ax = plot_lag_with_significance(
+        comp_fd,
+        sig_warm,
+        sig_cool,
+        lag=lag,
+        name=name,
+        levels=levels,
+        cbar_labels=cbar_labels,
+        hatch=hatch,
+        proxydb=proxydb,
+        plot_proxydb=plot_proxydb,
+        plot_proxydb_lgd=plot_proxydb_lgd,
+        site_markersize=site_markersize,
+    )
+
+    return {
+        "composite": comp_fd,
+        "bootstrap_composites": bootstrap_composites,
+        "non_erup": non_erup,
+        "ci_lo": ci_lo,
+        "ci_up": ci_up,
+        "sig_cool": sig_cool,
+        "sig_warm": sig_warm,
+        "fig": fig,
+        "ax": ax,
+    }
+
+
 def plot_comp_with_null(
     comp_fd,
     warm,
@@ -201,6 +332,23 @@ def sea_composite_ensemble(ens_ts, eruption_years, window=(-3, 6)):
         time=lags,
         value=composite_mean,
         value_name=ens_ts.value_name,
+    )
+
+
+def difference_ensemble_sea(ens_ts_1, ens_ts_2, name=None):
+    if not np.array_equal(ens_ts_1.time, ens_ts_2.time):
+        raise ValueError("SEA composites must use the same lags to take a difference.")
+
+    if np.shape(ens_ts_1.value) != np.shape(ens_ts_2.value):
+        raise ValueError("SEA composites must have the same ensemble shape to take a difference.")
+
+    if name is None:
+        name = f"{ens_ts_2.value_name} - {ens_ts_1.value_name}"
+
+    return cfr.EnsTS(
+        time=ens_ts_1.time,
+        value=ens_ts_2.value - ens_ts_1.value,
+        value_name=name,
     )
 
 

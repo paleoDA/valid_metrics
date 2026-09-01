@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "valid-metrics"
+version = "0.1.0"
+description = "Validation metrics for climate field reconstructions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cartopy",
+    "cfr",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "statsmodels",
+    "xarray",
+    "xeofs",
+]
+
+[tool.setuptools.packages.find]
+include = ["metrics*"]

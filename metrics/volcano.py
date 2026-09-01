@@ -3,8 +3,8 @@ import numpy as np
 
 def plot_volcanic_year(
     fd,
-    pdb,
-    year,
+    pdb=None,
+    year=None,
     name="",
     other_fd=None,
     levels=None,
@@ -16,11 +16,17 @@ def plot_volcanic_year(
 ):
     from cfr.proxy import ProxyDatabase
 
+    if year is None:
+        raise ValueError("year must be provided.")
+
     filtered_pdb = ProxyDatabase()
-    for _, pobj in pdb.records.items():
-        if year in pobj.time:
-            filtered_pdb += pobj
+    if pdb is not None:
+        for _, pobj in pdb.records.items():
+            if year in pobj.time:
+                filtered_pdb += pobj
     filtered_pdb.refresh()
+
+    show_proxydb = plot_proxydb and pdb is not None
 
     if other_fd is None:
         plot_fd = fd[str(year)]
@@ -43,9 +49,9 @@ def plot_volcanic_year(
 
     fig, ax = plot_fd.plot(
         title=title,
-        plot_proxydb=plot_proxydb,
+        plot_proxydb=show_proxydb,
         proxydb=filtered_pdb,
-        plot_proxydb_lgd=True,
+        plot_proxydb_lgd=show_proxydb,
         proxydb_lgd_kws={
             "bbox_to_anchor": (1.2, 1),
             "loc": "upper left",
