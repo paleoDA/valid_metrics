@@ -81,6 +81,80 @@ def reshape_for_depth(data_array, year_idx):
     year_reshaped = year_data.values.reshape(n_ens, n_gridpoints)
     return year_reshaped.T
 
+
+def _drop_duplicate_cyclic_longitude(data_array_1, data_array_2):
+    """Drop a shared duplicate longitude endpoint such as 0 and 360 degrees.
+
+    A cyclic latitude-longitude grid sometimes includes both endpoints even
+    though they represent the same meridian. Keeping both would give that
+    meridian twice the weight of every other longitude in the integrated
+    depth. The endpoint is removed only when both arrays have matching
+    longitude coordinates and their first and last coordinates differ by a
+    full 360-degree cycle.
+    """
+    if 'lon' not in data_array_1.dims or 'lon' not in data_array_2.dims:
+        return data_array_1, data_array_2, False
+
+    lon_1 = np.asarray(data_array_1.coords['lon'].values)
+    lon_2 = np.asarray(data_array_2.coords['lon'].values)
+
+    if lon_1.size < 2 or lon_2.size < 2:
+        return data_array_1, data_array_2, False
+
+    matching_longitudes = (
+        lon_1.shape == lon_2.shape
+        and np.allclose(lon_1, lon_2, equal_nan=False)
+    )
+    cyclic_endpoints = (
+        np.isfinite(lon_1[0])
+        and np.isfinite(lon_1[-1])
+        and np.isclose(abs(lon_1[-1] - lon_1[0]), 360.0)
+    )
+
+    if not (matching_longitudes and cyclic_endpoints):
+        return data_array_1, data_array_2, False
+
+    return (
+        data_array_1.isel(lon=slice(None, -1)),
+        data_array_2.isel(lon=slice(None, -1)),
+        True,
+    )
+
+
+def _validate_finite_matrix(matrix, input_name, year):
+    """Reject missing or infinite field values before computing depth."""
+    finite = np.isfinite(matrix)
+    if np.all(finite):
+        return
+
+    invalid_count = int(matrix.size - np.count_nonzero(finite))
+    raise ValueError(
+        f"{input_name} contains {invalid_count} non-finite value(s) in "
+        f"year {year}. KD was not computed because Harris's integrated "
+        "depth does not define missing-value handling."
+    )
+
+
+def _handle_nonfinite_matrices(fmat, gmat, year, missing):
+    """Apply the requested missing-value policy to a pair of yearly fields."""
+    if missing == 'raise':
+        _validate_finite_matrix(fmat, 'data_array_1', year)
+        _validate_finite_matrix(gmat, 'data_array_2', year)
+        return fmat, gmat
+
+    common_valid = (
+        np.all(np.isfinite(fmat), axis=1)
+        & np.all(np.isfinite(gmat), axis=1)
+    )
+    n_gridpoints_used = int(np.count_nonzero(common_valid))
+    if n_gridpoints_used == 0:
+        raise ValueError(
+            f"No grid points contain finite values for every ensemble "
+            f"member in both inputs in year {year}. KD is undefined."
+        )
+
+    return fmat[common_valid, :], gmat[common_valid, :]
+
 ## Main KStat Function
 
 
@@ -279,7 +353,13 @@ def kstat_perm(fmat, gmat, perms=500, random_state=None):
     return kd_observed, p_value_perm
 
 ## Full Algorithm
-def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, perms=500):
+def compute_kd_timeseries(
+    data_array_1,
+    data_array_2,
+    use_permutation=False,
+    perms=500,
+    missing='raise',
+):
     """
     Compute time-evolving KD statistic comparing two reconstructions.
     
@@ -293,6 +373,10 @@ def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, per
         If True, use permutation test (slower). Default False uses asymptotic.
     perms : int, optional
         Number of permutations if use_permutation=True
+    missing : {'raise', 'drop'}, optional
+        How to handle non-finite values. ``'raise'`` stops with an informative
+        error. ``'drop'`` removes, for each year, any grid point that is not
+        finite in every member of both ensembles. Default is ``'raise'``.
     
     Returns
     -------
@@ -301,18 +385,36 @@ def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, per
         'p_values': array (n_years,) - p-value per year
         'years': array (n_years,) - year labels from data
     """
+    if missing not in {'raise', 'drop'}:
+        raise ValueError("missing must be either 'raise' or 'drop'.")
+
+    data_array_1, data_array_2, _ = (
+        _drop_duplicate_cyclic_longitude(data_array_1, data_array_2)
+    )
+
     n_years = data_array_1.shape[0]
     
     kd_stats = np.zeros(n_years)
     p_values = np.zeros(n_years)
     
     for year_idx in range(n_years):
+        year = data_array_1.coords['time'].values[year_idx]
+
         if year_idx % 100 == 0:
-            print(f"Processing year {year_idx}/{n_years} (year {data_array_1.coords['time'].values[year_idx]})...")
+            print(
+                f"Processing year {year_idx}/{n_years} "
+                f"(year {year})..."
+            )
         
         # Prepare data for this year
         fmat = reshape_for_depth(data_array_1, year_idx)
         gmat = reshape_for_depth(data_array_2, year_idx)
+        fmat, gmat = _handle_nonfinite_matrices(
+            fmat,
+            gmat,
+            year,
+            missing,
+        )
         
         # Compute KD statistic
         if use_permutation:
@@ -323,7 +425,7 @@ def compute_kd_timeseries(data_array_1, data_array_2, use_permutation=False, per
     return {
         'kd_stats': kd_stats,
         'p_values': p_values,
-        'years': data_array_1.coords['time'].values
+        'years': data_array_1.coords['time'].values,
     }
 
 ## Compute and Plot
@@ -353,13 +455,15 @@ def compute_and_plot_kd(
     name2,
     region=None,
     highlight_threshold=0.9,
+    missing='raise',
 ):
 
     print(f"Computing KD statistic for {name1} vs {name2}...")
     results = compute_kd_timeseries(
         fd1,
         fd2,
-        use_permutation=False  # Use asymptotic approximation
+        use_permutation=False,  # Use asymptotic approximation
+        missing=missing,
     )
 
     print(f"\nCompleted {len(results['kd_stats'])} years")
@@ -575,6 +679,7 @@ def compute_and_plot_kd_reg(
     name2,
     region=None,
     highlight_threshold=0.9,
+    missing='raise',
 ):
     """
     Regional KD wrapper matching the final-project notebook.
@@ -591,6 +696,7 @@ def compute_and_plot_kd_reg(
         name2,
         region=region,
         highlight_threshold=highlight_threshold,
+        missing=missing,
     )
 
     high_kd_mask = results['kd_stats'] > highlight_threshold
